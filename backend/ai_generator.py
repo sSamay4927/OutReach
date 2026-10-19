@@ -1,0 +1,610 @@
+"""
+Groq API email generation logic.
+Constructs prompts per the spec and returns parsed JSON with subject + body.
+Incorporates resume highlights for personalization.
+"""
+
+import json
+import random
+import time
+from groq import Groq
+from utils import resolve_company_name
+
+GROQ_MODEL = "llama-3.3-70b-versatile"
+
+SYSTEM_PROMPT = """You are helping a college student write personalised cold outreach emails for internship/job opportunities.
+These emails will be sent directly from the student's Gmail. They must feel like real, human-written emails — not templates, not cover letters, not LinkedIn messages.
+
+MANDATORY EMAIL STRUCTURE (follow this every time):
+1. Greeting line: Start with "Hi [Name]," if name is known, or "Hi there," if unknown. Never "Dear Sir/Madam". Never skip the greeting.
+2. Opening sentence: A natural, varied opener that isn't "I've been following your work". It could be:
+   - A direct, confident intro ("I'm Vinayak, a third-year ChemE student at NIT Durgapur, and I wanted to reach out about...")
+   - A brief, genuine observation about the company (only if it feels specific and natural — not forced flattery)
+   - Getting straight to the point ("I came across [Company] while researching ML startups and thought I'd reach out directly.")
+   Vary this opener every single time. Never repeat the same structure across emails.
+3. Middle (2–3 sentences): Briefly state what you're looking for, mention ONE specific thing from your background (a project or experience, one sentence max), and connect it to why you're reaching out to them specifically.
+4. Availability + ask (1–2 sentences): Mention availability and end with a soft, specific ask. Vary the closing line — do NOT use the same sentence across emails.
+5. Sign-off: "Best," followed by the student's first name on a new line.
+
+BANNED PHRASES (never use any of these):
+- "I've been following [X]'s work"
+- "I am writing to express my interest"
+- "I would be honored"
+- "I am a passionate individual"
+- "I believe my skills could be a great fit"
+- "Would love to hear if there's any opportunity to contribute" (you may vary the sentiment but not reuse this exact line)
+- "synergy", "leverage", "cutting-edge", "innovative solutions", "bringing to the table"
+- "I hope this email finds you well"
+- "Dear Sir/Madam"
+- Any phrase that sounds like it was copied from a cover letter template
+
+TONE:
+- Semi-formal: professional but conversational — like a confident student emailing a founder, not a formal job application
+- Direct and concise — get to the point quickly
+- Warm but not sycophantic — genuine, not flattering
+
+LENGTH: 200-240 words for the body (including greeting and sign-off). Shorter is better if the message is complete.
+
+OUTPUT FORMAT: Return ONLY a valid JSON object: {"subject": "...", "body": "..."}
+The body must include the greeting line and sign-off. No markdown, no extra text."""
+
+
+FOLLOWUP_SYSTEM_PROMPT = """You are helping a college student write a brief follow-up email for an unanswered internship/job outreach.
+
+MANDATORY EMAIL STRUCTURE:
+1. Greeting: "Hi [Name]," or "Hi there," — same as the original email
+2. Opening: A natural reference to the previous email (e.g., "Just wanted to follow up on my note from last week." or "Circling back on my previous email in case it got buried.")
+3. Body (1–2 sentences max): A very brief re-statement of interest — do NOT repeat the full pitch
+4. Soft closing ask: Low-pressure, open-ended (e.g., "Even a quick note on whether this is the right time would be great.")
+5. Sign-off: "Best," + first name
+
+RULES:
+- 80–110 words total including greeting and sign-off
+- Warm and non-pushy — confident, not desperate
+- Do NOT use: "I hope this email finds you well", "I wanted to circle back" as the first three words of every email (vary it), "Dear Sir/Madam"
+- Sound like a real person following up, not an automated sequence
+
+OUTPUT FORMAT: Return ONLY valid JSON: {"subject": "Re: [original subject]", "body": "..."}"""
+
+
+def build_resume_highlights(resume_parsed: dict) -> str:
+    """
+    Construct a concise resume highlights block for injection into the AI prompt.
+    Picks the most relevant projects and one experience entry.
+    """
+    if not resume_parsed:
+        return "No resume data available."
+    
+    lines = []
+
+    projects = resume_parsed.get("projects", [])
+    projects = projects.copy()
+    random.shuffle(projects)
+
+    if projects:
+        lines.append("""PROJECTS (listed in random order — evaluate ALL of them before choosing):
+Selection rule: Choose the project whose tech stack most closely matches this recipient's company domain.
+- If company is in AI/ML/healthcare → prefer Coeur AI
+- If company is in SaaS/ad-tech/marketing/e-commerce → prefer AdGenAI
+- If company is in research/education/NLP/data → prefer The Rigveda Project
+- If unclear → pick whichever has the most tech overlap with the job description
+Do NOT default to the first project listed. Actively reason about fit.""")
+        for p in projects[:4]:  # max 4 projects passed to AI
+            title = p.get("title", "")
+            desc = p.get("description", "")
+            if title:
+                lines.append(f"  - {title}: {desc}")
+
+    experience = resume_parsed.get("experience", [])
+    if experience:
+        lines.append("EXPERIENCE / RESEARCH:")
+        for e in experience[:3]:  # max 3 entries
+            role = e.get("role", "")
+            org = e.get("organization", "")
+            desc = e.get("description", "")
+            if role:
+                lines.append(f"  - {role} at {org}: {desc}")
+
+    achievements = resume_parsed.get("achievements", [])
+    if achievements:
+        lines.append("NOTABLE ACHIEVEMENTS:")
+        for a in achievements[:3]:
+            lines.append(f"  - {a}")
+
+    return "\n".join(lines) if lines else "No structured resume data extracted."
+
+
+def generate_email(profile, recipient, campaign_goal, additional_context, api_key, resume_parsed=None):
+    """
+    Generate a unique cold outreach email for a single recipient.
+    """
+    domain = recipient["email"].split("@")[1]
+    company = resolve_company_name(domain, api_key)
+    recipient_name = recipient.get("name") or "address them naturally without a explicit name if unknown"
+    
+    resume_block = build_resume_highlights(resume_parsed) if resume_parsed else "Not available."
+
+    user_prompt = f"""Generate a cold outreach email from the following student to the recipient at {company}.
+
+STUDENT PROFILE:
+- Name: {profile.get('name', '')}
+- College: {profile.get('college', '')}, {profile.get('branch', '')}, {profile.get('year', '')}
+- CGPA: {profile.get('cgpa', 'Not specified')}
+- Skills: {profile.get('skills', '')}
+- Bio: {profile.get('bio', '')}
+- GitHub: {profile.get('github', 'Not provided')}
+- LinkedIn: {profile.get('linkedin', 'Not provided')}
+
+RESUME HIGHLIGHTS (use to personalise the email — pick 1–2 specific things to naturally mention):
+{resume_block}
+
+RECIPIENT:
+- Email: {recipient['email']}
+- Name: {recipient_name}
+- Company: {company}
+
+CAMPAIGN GOAL:
+{campaign_goal}
+
+ADDITIONAL CONTEXT:
+{additional_context or 'None'}
+
+RESUME HIGHLIGHT RULES:
+- Mention exactly ONE project or experience from RESUME HIGHLIGHTS — pick the most relevant to this company's domain
+- Keep it to one natural sentence (e.g., "I recently built X that does Y using Z" — not a full description)
+- The goal is to intrigue them enough to open the resume, not to summarise it
+- Do NOT mention multiple projects
+- Do NOT copy the project description verbatim — rephrase naturally
+
+EMAIL STRUCTURE RULES:
+- Line 1 must be the greeting: "Hi [Name]," or "Hi there,"
+- Vary the opening sentence — do not start with the same phrase as other emails
+- Vary the closing ask — do not use identical wording across emails
+- The email must read like a natural message — not a list of credentials
+- Give proper spacing of 1 blank line between paragraphs. Don't dump every information into 1 single paragraph.
+
+SIGN-OFF:
+End the email body with exactly this format (on its own lines, after the main content):
+
+Best,
+{profile.get('name', '').split()[0] if profile.get('name') else 'Student'}
+
+Return ONLY valid JSON: {{"subject": "...", "body": "..."}}"""
+
+    return _call_groq(SYSTEM_PROMPT, user_prompt, api_key)
+
+
+def generate_followup(profile, original_subject, original_body, followup_context, api_key, resume_parsed=None):
+    """
+    Generate a follow-up email.
+    """
+    resume_block = build_resume_highlights(resume_parsed) if resume_parsed else "Not available."
+    first_name = profile.get('name', '').split()[0] if profile.get('name') else 'Student'
+
+    user_prompt = f"""Generate a follow-up email that will be sent as a reply to the email thread below.
+
+The student is following up because they haven't received a response. The tone should be:
+- Brief (80–120 words)
+- Warm and non-pushy — not desperate
+- Reference the original email naturally ("just wanted to follow up on my previous message")
+- End with a soft, open-ended ask
+
+ORIGINAL EMAIL SENT:
+Subject: {original_subject}
+Body: {original_body}
+
+STUDENT PROFILE:
+- Name: {profile.get('name', '')}
+- College: {profile.get('college', '')}, {profile.get('branch', '')}, {profile.get('year', '')}
+- Skills: {profile.get('skills', '')}
+
+RESUME HIGHLIGHTS (optional — only reference if naturally relevant to the follow-up):
+{resume_block}
+
+FOLLOW-UP CONTEXT FROM USER:
+{followup_context or 'None provided — write a standard polite follow-up.'}
+
+SIGN-OFF:
+End the follow-up body with exactly this format:
+
+Best,
+{first_name}
+
+Return ONLY valid JSON: {{"subject": "Re: {original_subject}", "body": "..."}}"""
+
+    return _call_groq(FOLLOWUP_SYSTEM_PROMPT, user_prompt, api_key)
+
+
+def generate_contextual_followup(profile, original_subject, original_body,
+                                  recipient_email, recipient_name,
+                                  reply_status, reply_content,
+                                  check_back_date, global_context,
+                                  api_key, resume_parsed=None):
+    """
+    Generate a context-aware follow-up email based on the recipient's reply status.
+    Each status produces a fundamentally different tone and intent.
+    """
+
+    domain = recipient_email.split("@")[1]
+    company = resolve_company_name(domain, api_key)
+    first_name = profile.get('name', '').split()[0] if profile.get('name') else 'Student'
+
+    greeting = f"Hi {recipient_name.split()[0].capitalize()}," if recipient_name else "Hi there,"
+
+    # Build status-specific instruction block
+    status_instructions = _build_status_instructions(
+        reply_status, reply_content, check_back_date, company
+    )
+
+    resume_block = build_resume_highlights(resume_parsed) if resume_parsed else "Not available."
+
+    system_prompt = f"""You are helping a college student write a follow-up email for an internship/job outreach.
+The follow-up must be tailored precisely to the situation described below — tone, length, and intent 
+must match the recipient's reply status exactly.
+
+GENERAL RULES:
+- Sound completely human — not automated, not templated
+- Never start with "I hope this email finds you well"
+- Never use "Dear Sir/Madam"
+- Use semi-formal tone throughout
+- Start with the exact greeting provided
+- End with: Best,\\n{first_name}
+- Return ONLY valid JSON: {{"subject": "Re: {original_subject}", "body": "..."}}"""
+
+    user_prompt = f"""Write a follow-up email for this specific situation.
+
+SITUATION:
+{status_instructions}
+
+ORIGINAL EMAIL:
+Subject: {original_subject}
+Body: {original_body}
+
+STUDENT PROFILE:
+- Name: {profile.get('name', '')}
+- College: {profile.get('college', '')}, {profile.get('year', '')}
+- Skills: {profile.get('skills', '')}
+- GitHub: {profile.get('github', 'Not provided')}
+
+RESUME HIGHLIGHTS (use only if directly relevant):
+{resume_block}
+
+RECIPIENT:
+- Email: {recipient_email}
+- Name: {recipient_name or 'Unknown'}
+- Company: {company}
+
+GREETING TO USE (first line, mandatory):
+{greeting}
+
+ADDITIONAL CONTEXT FROM USER:
+{global_context or 'None provided.'}
+
+SIGN-OFF:
+End with exactly:
+Best,
+{first_name}
+
+Return ONLY valid JSON: {{"subject": "Re: {original_subject}", "body": "..."}}"""
+
+    return _call_groq(system_prompt, user_prompt, api_key)
+
+
+def _build_status_instructions(reply_status, reply_content, check_back_date, company):
+    """
+    Returns a detailed, status-specific instruction block for the AI prompt.
+    This is the core logic that makes each follow-up fundamentally different.
+    """
+
+    reply_section = f"\nTHEIR ACTUAL REPLY:\n\"\"\"\n{reply_content}\n\"\"\"\n" if reply_content else ""
+
+    if reply_status == "no_reply":
+        return f"""STATUS: No Reply — the recipient has not responded to the original email.
+
+TONE & INTENT:
+- Brief and non-pushy — 80 to 110 words total
+- Acknowledge they are likely busy
+- Do not repeat the full pitch from the original email
+- A single soft nudge — "wanted to make sure this didn't get buried"
+- End with a low-pressure, open-ended question
+- Do NOT sound desperate or apologetic{reply_section}"""
+
+    elif reply_status == "check_back":
+        date_line = f"- They asked you to follow up around: {check_back_date}" if check_back_date else ""
+        return f"""STATUS: Check Back — the recipient replied and asked you to reach out again later.
+
+TONE & INTENT:
+- Warm and conversational — you already have a micro-relationship since they replied
+- Open by referencing THEIR suggestion to follow up (e.g., "You had mentioned reaching out again — following up as suggested")
+- Do NOT re-introduce yourself fully — they remember you
+- Keep it brief — 90 to 130 words
+- Mention your availability for May to July 2026 in one line
+- End with a soft, specific ask — a quick call, a 15-min chat, etc.
+{date_line}{reply_section}"""
+
+    elif reply_status == "interested":
+        return f"""STATUS: Interested — the recipient replied positively and wants more information or a call.
+
+TONE & INTENT:
+- Warm, confident, and direct — do not undersell yourself
+- Directly address whatever they asked or expressed interest in
+- If they asked for GitHub/portfolio, acknowledge that naturally
+- Propose a concrete next step — suggest a specific timeframe for a call or meeting
+- 100 to 150 words
+- This is NOT a nudge — it is an advancement email. Move the conversation forward.{reply_section}"""
+
+    elif reply_status == "no_openings":
+        return f"""STATUS: No Openings — the recipient explicitly said there are no positions available right now.
+
+TONE & INTENT:
+- Short, gracious, zero pressure — 60 to 90 words
+- Thank them genuinely for taking the time to reply (most people don't)
+- Express that you understand completely
+- Ask warmly if they could keep your profile in mind for future openings
+- OR ask if they know anyone else in their network who might be looking for interns
+- Leave a strongly positive final impression — these people move companies and open roles later
+- Do NOT sound disappointed or pushy{reply_section}"""
+
+    else:
+        # Fallback for any unexpected status
+        return f"""STATUS: General follow-up.
+TONE: Semi-formal, brief, warm. 80 to 120 words.{reply_section}"""
+
+
+def _call_gemini(system_prompt: str, user_prompt: str, api_key: str, retries: int = 3) -> dict:
+    """Call Google Gemini Flash using the new google-genai SDK."""
+    import logging
+    _log = logging.getLogger("batch_worker")
+
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+
+    last_error = None
+    for attempt in range(retries):
+        try:
+            seed_note = f"\n[Variation seed: {random.randint(1000, 9999)}]"
+            response = client.models.generate_content(
+                model="gemini-3.1-flash-lite",
+                contents=user_prompt + seed_note,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_prompt,
+                    temperature=0.9,
+                    response_mime_type="application/json",
+                ),
+            )
+            text = response.text.strip()
+            result = json.loads(text)
+            if "subject" not in result or "body" not in result:
+                raise ValueError("Response missing 'subject' or 'body' keys")
+            return result
+        except (json.JSONDecodeError, ValueError) as e:
+            last_error = e
+            if attempt < retries - 1:
+                continue
+            raise Exception(f"Gemini JSON parse failed after {retries} attempts: {e}")
+        except Exception as e:
+            err_str = str(e).lower()
+            is_quota_error = any(x in err_str for x in ["resource_exhausted", "quota", "daily limit", "rate limit", "429"])
+            is_rpm_limit = any(x in err_str for x in ["per_minute", "per-minute", "rpm", "requests_per_minute"])
+
+            if is_quota_error:
+                is_zero_quota = "limit: 0" in err_str
+                if is_zero_quota:
+                    # Project has no free-tier quota allocated — get a new key from AI Studio
+                    _log.warning(f"Gemini API key has 0 quota (wrong project type) — falling back to Groq: {e}")
+                    raise Exception(f"Gemini quota not allocated: {e}")
+                if not is_rpm_limit:
+                    # Daily limit exhausted — retrying won't help until midnight
+                    _log.warning(f"Gemini daily limit hit — falling back to Groq: {e}")
+                    raise Exception(f"Gemini daily limit: {e}")
+                # RPM limit — transient, wait for the rate window to clear
+                wait = 60
+                _log.warning(f"Gemini RPM limit — retrying in {wait}s (attempt {attempt+1}/{retries}): {e}")
+                time.sleep(wait)
+                last_error = e
+            else:
+                raise Exception(f"Gemini API error: {e}")
+
+    raise Exception(f"Gemini RPM limit persists after {retries} retries: {last_error}")
+
+
+def _call_cerebras(system_prompt: str, user_prompt: str, api_key: str, retries: int = 4) -> dict:
+    """Call Cerebras API (OpenAI-compatible) using llama-3.3-70b."""
+    import logging
+    _log = logging.getLogger("batch_worker")
+    from cerebras.cloud.sdk import Cerebras
+
+    client = Cerebras(api_key=api_key)
+    model = "llama3.1-8b"
+
+    last_error = None
+    for attempt in range(retries):
+        try:
+            seed_note = f"\n[Variation seed: {random.randint(1000, 9999)}]"
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_prompt + seed_note},
+                ],
+                temperature=0.9,
+                max_completion_tokens=1024,
+            )
+            content = response.choices[0].message.content
+            if content is None:
+                raise ValueError("Cerebras returned null content")
+            text = content.strip()
+            # Strip markdown code fences if present (```json ... ```)
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+            result = json.loads(text)
+            if "subject" not in result or "body" not in result:
+                raise ValueError("Response missing 'subject' or 'body' keys")
+            return result
+        except (json.JSONDecodeError, ValueError) as e:
+            last_error = e
+            if attempt < retries - 1:
+                continue
+            raise Exception(f"Cerebras JSON parse failed after {retries} attempts: {e}")
+        except Exception as e:
+            err_str = str(e).lower()
+            is_daily = any(x in err_str for x in ["daily", "tokens per day", "token_per_day"])
+            is_rate  = any(x in err_str for x in ["rate limit", "429", "too many requests", "tokens per minute"])
+            if is_daily:
+                _log.warning(f"Cerebras daily token limit hit — falling back: {e}")
+                raise Exception(f"Cerebras daily limit: {e}")
+            elif is_rate:
+                wait = 30 * (attempt + 1)
+                _log.warning(f"Cerebras rate limit — retrying in {wait}s (attempt {attempt+1}/{retries}): {e}")
+                time.sleep(wait)
+                last_error = e
+            else:
+                raise Exception(f"Cerebras API error: {e}")
+
+    raise Exception(f"Cerebras rate limit persists after {retries} retries: {last_error}")
+
+
+def generate_email_auto(profile, recipient, campaign_goal, additional_context,
+                        api_key, provider, resume_parsed=None):
+    """
+    Generate a cold outreach email using a specified provider.
+    provider: "gemini" | "groq_1" | "groq_2" | "groq_3"
+    Uses the same prompt logic as generate_email().
+    For Gemini, company name falls back to domain parsing (avoids extra Groq calls).
+    """
+    domain = recipient["email"].split("@")[1]
+
+    if provider.startswith("groq"):
+        company = resolve_company_name(domain, api_key)
+    else:
+        company = domain.split(".")[0].replace("-", " ").replace("_", " ").title()
+
+    recipient_name = recipient.get("name") or "address them naturally without an explicit name if unknown"
+    resume_block = build_resume_highlights(resume_parsed) if resume_parsed else "Not available."
+
+    user_prompt = f"""Generate a cold outreach email from the following student to the recipient at {company}.
+
+STUDENT PROFILE:
+- Name: {profile.get('name', '')}
+- College: {profile.get('college', '')}, {profile.get('branch', '')}, {profile.get('year', '')}
+- CGPA: {profile.get('cgpa', 'Not specified')}
+- Skills: {profile.get('skills', '')}
+- Bio: {profile.get('bio', '')}
+- GitHub: {profile.get('github', 'Not provided')}
+- LinkedIn: {profile.get('linkedin', 'Not provided')}
+
+RESUME HIGHLIGHTS (use to personalise the email — pick 1–2 specific things to naturally mention):
+{resume_block}
+
+RECIPIENT:
+- Email: {recipient['email']}
+- Name: {recipient_name}
+- Company: {company}
+
+CAMPAIGN GOAL:
+{campaign_goal}
+
+ADDITIONAL CONTEXT:
+{additional_context or 'None'}
+
+RESUME HIGHLIGHT RULES:
+- Mention exactly ONE project or experience from RESUME HIGHLIGHTS — pick the most relevant to this company's domain
+- Keep it to one natural sentence
+- Do NOT mention multiple projects
+- Do NOT copy the project description verbatim
+
+EMAIL STRUCTURE RULES:
+- Line 1 must be the greeting: "Hi [Name]," or "Hi there,"
+- Vary the opening sentence — do not start with the same phrase as other emails
+- Vary the closing ask — do not use identical wording across emails
+- Give proper spacing of 1 blank line between paragraphs
+
+SIGN-OFF:
+End the email body with exactly this format:
+
+Best,
+{profile.get('name', '').split()[0] if profile.get('name') else 'Student'}
+
+Return ONLY valid JSON: {{"subject": "...", "body": "..."}}"""
+
+    if provider == "gemini":
+        return _call_gemini(SYSTEM_PROMPT, user_prompt, api_key)
+    elif provider == "cerebras":
+        return _call_cerebras(SYSTEM_PROMPT, user_prompt, api_key)
+    else:
+        return _call_groq(SYSTEM_PROMPT, user_prompt, api_key)
+
+
+def _call_groq(system_prompt, user_prompt, api_key, retries=4, model="meta-llama/llama-4-scout-17b-16e-instruct"):
+    """
+    Call the Groq API and parse the JSON response.
+    Retries on rate limits or service unavailable.
+    """
+    client = Groq(api_key=api_key)
+
+    last_error = None
+    for attempt in range(retries):
+        try:
+            # Add random seed variation for uniqueness
+            seed_note = f"\n[Variation seed: {random.randint(1000, 9999)}]"
+
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt + seed_note}
+                ],
+                temperature=0.9,
+                response_format={"type": "json_object"}
+            )
+
+            text = response.choices[0].message.content.strip()
+            result = json.loads(text)
+
+            if "subject" not in result or "body" not in result:
+                raise ValueError("Response missing 'subject' or 'body' keys")
+
+            return result
+
+        except (json.JSONDecodeError, ValueError) as e:
+            last_error = e
+            if attempt < retries - 1:
+                continue
+            raise Exception(f"Failed to parse Groq response after {retries} attempts: {e}")
+            
+        except Exception as e:
+            err_str = str(e).upper()
+            FALLBACK_MODELS = [
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llama-3.3-70b-versatile",
+    "qwen/qwen3-32b",
+    "llama-3.1-8b-instant",
+]
+
+        if "TOKENS PER DAY" in err_str or "REQUESTS PER DAY" in err_str or "TOKENS PER MINUTE" in err_str:
+            try:
+                current_index = FALLBACK_MODELS.index(model)
+            except ValueError:
+                current_index = -1
+
+            if current_index < len(FALLBACK_MODELS) - 1:
+                next_model = FALLBACK_MODELS[current_index + 1]
+                print(f"Rate limit hit on {model}. Trying next model: {next_model}...")
+                return _call_groq(system_prompt, user_prompt, api_key, retries, model=next_model)
+
+            raise Exception(f"All models exhausted due to rate limits. Try again later.")
+                
+            if "429" in err_str or "RATE_LIMIT" in err_str or "503" in err_str or "UNAVAILABLE" in err_str:
+                last_error = e
+                wait = 5 * (2 ** attempt)  # 5s, 10s, 20s, 40s
+                print(f"Groq API error ({e}) on model {model} — retrying in {wait}s (attempt {attempt+1}/{retries})")
+                time.sleep(wait)
+            else:
+                 raise Exception(f"Groq API error: {e}")
+
+    raise Exception(f"Groq API unavailable/failed after {retries} retries. Last error: {last_error}")

@@ -1,0 +1,9 @@
+flask
+flask-cors
+groq
+pdfplumber
+duckduckgo-search
+apscheduler
+google-genai
+gunicorn
+cerebras-cloud-sdk
