@@ -35,7 +35,7 @@ cleanup() {
 trap cleanup SIGTERM SIGINT
 
 # 3. Start Gunicorn Web Server
-PORT_NUM="${PORT:-5000}"
+PORT_NUM="${PORT:-7860}"
 echo "[3/3] Starting Gunicorn on port $PORT_NUM..."
 gunicorn \
     --workers 1 \

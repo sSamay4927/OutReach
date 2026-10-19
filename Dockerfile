@@ -34,10 +34,17 @@ RUN sed -i 's/\r$//' render_start.sh && chmod +x render_start.sh
 
 # Environment settings
 ENV PYTHONUNBUFFERED=1 \
-    PORT=5000 \
+    PORT=7860 \
     FRONTEND_DIST=/app/frontend/dist \
     DATA_DIR=/app/backend
 
-EXPOSE 5000
+# Hugging Face Spaces runs as user with UID 1000
+RUN useradd -m -u 1000 user && \
+    chown -R user:user /app && \
+    chmod -R 777 /app
+
+USER user
+
+EXPOSE 7860
 
 CMD ["./render_start.sh"]
