@@ -6,7 +6,8 @@ Loads/saves config.json with defaults for profile, credentials, and settings.
 import json
 import os
 
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+CONFIG_PATH = os.path.join(DATA_DIR, "config.json")
 
 DEFAULT_CONFIG = {
     "gmail_address": "",
@@ -28,16 +29,39 @@ DEFAULT_CONFIG = {
         "linkedin": "",
         "bio": ""
     },
-    "resume_path": "uploads/resume.pdf",
+    "resume_path": os.path.join(DATA_DIR, "uploads", "resume.pdf"),
     "resume_parsed": {}
 }
 
 
+def _env_defaults():
+    """Populate default values from environment variables if present."""
+    env_map = {
+        "gmail_address": os.environ.get("GMAIL_ADDRESS", ""),
+        "gmail_app_password": os.environ.get("GMAIL_APP_PASSWORD", ""),
+        "groq_api_key": os.environ.get("GROQ_API_KEY", ""),
+        "groq_api_key_2": os.environ.get("GROQ_API_KEY_2", ""),
+        "groq_api_key_3": os.environ.get("GROQ_API_KEY_3", ""),
+        "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
+        "cerebras_api_key": os.environ.get("CEREBRAS_API_KEY", ""),
+    }
+    if os.environ.get("SEND_DELAY_SECONDS"):
+        try:
+            env_map["send_delay_seconds"] = int(os.environ.get("SEND_DELAY_SECONDS"))
+        except ValueError:
+            pass
+    return {k: v for k, v in env_map.items() if v}
+
+
 def load_config():
-    """Load config from disk. Create with defaults if missing."""
+    """Load config from disk. Create with defaults/env vars if missing."""
+    env_overrides = _env_defaults()
+
     if not os.path.exists(CONFIG_PATH):
-        save_config(DEFAULT_CONFIG)
-        return DEFAULT_CONFIG.copy()
+        cfg = DEFAULT_CONFIG.copy()
+        cfg.update(env_overrides)
+        save_config(cfg)
+        return cfg
 
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         config = json.load(f)
@@ -45,6 +69,12 @@ def load_config():
     # Merge with defaults to handle missing keys after upgrades
     merged = DEFAULT_CONFIG.copy()
     merged.update(config)
+
+    # Fill in any missing/empty keys with environment variables if available
+    for k, v in env_overrides.items():
+        if not merged.get(k):
+            merged[k] = v
+
     if "profile" in config:
         merged_profile = DEFAULT_CONFIG["profile"].copy()
         merged_profile.update(config["profile"])

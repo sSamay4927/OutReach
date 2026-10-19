@@ -31,11 +31,13 @@ import quota_tracker
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
-LOG_PATH    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker.log")
-STATUS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker_status.json")
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+
+LOG_PATH    = os.path.join(DATA_DIR, "worker.log")
+STATUS_PATH = os.path.join(DATA_DIR, "worker_status.json")
 
 # Per-campaign follow-up job progress (written by worker, read by API).
-FOLLOWUP_STATUS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "followup_status.json")
+FOLLOWUP_STATUS_PATH = os.path.join(DATA_DIR, "followup_status.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,7 +49,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("batch_worker")
 
-RESUME_PATH            = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads", "resume.pdf")
+RESUME_PATH            = os.path.join(DATA_DIR, "uploads", "resume.pdf")
 GENERATE_BATCH         = 15   # Initial emails generated per loop iteration
 GEMINI_RPM_SLEEP       = 4    # Seconds between Gemini calls  (15 RPM limit)
 CEREBRAS_RPM_SLEEP     = 2    # Seconds between Cerebras calls (30 RPM limit)

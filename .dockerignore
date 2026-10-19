@@ -1,0 +1,14 @@
+.git
+.github
+frontend/node_modules
+frontend/dist
+backend/venv
+backend/__pycache__
+backend/*.pyc
+backend/outreach.db
+backend/config.json
+backend/worker.log
+backend/uploads/*.pdf
+deploy
+*.pem
+*.log

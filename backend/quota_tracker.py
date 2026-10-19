@@ -8,7 +8,8 @@ import os
 import threading
 from datetime import datetime, timedelta, timezone
 
-QUOTA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "quotas.json")
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+QUOTA_PATH = os.path.join(DATA_DIR, "quotas.json")
 
 DAILY_LIMITS = {
     "gemini":      500,   # gemini-3.1-flash-lite free tier (15 RPM, 500 RPD)

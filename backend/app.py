@@ -6,9 +6,9 @@ import os
 import json
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 
@@ -50,8 +50,38 @@ def get_next_groq_key(cycle):
 app = Flask(__name__)
 CORS(app)
 
-UPLOAD_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
+DATA_DIR = os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+UPLOAD_FOLDER = os.path.join(DATA_DIR, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# ─── Basic Auth & Health Check (for Render / Public Deployments) ─────────────
+
+@app.before_request
+def require_basic_auth():
+    # Allow health check to succeed without auth for pingers & Render monitor
+    if request.path == "/api/health":
+        return None
+
+    auth_user = os.environ.get("AUTH_USERNAME")
+    auth_pass = os.environ.get("AUTH_PASSWORD")
+    if not auth_user or not auth_pass:
+        return None
+
+    auth = request.authorization
+    if not auth or auth.username != auth_user or auth.password != auth_pass:
+        return (
+            "Access to Outreach Tool requires valid authentication.",
+            401,
+            {"WWW-Authenticate": 'Basic realm="Outreach Tool Login"'}
+        )
+
+@app.route("/api/health", methods=["GET"])
+def health_check():
+    return jsonify({
+        "status": "healthy",
+        "service": "outreach-tool",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }), 200
 
 # In-memory progress tracking for send jobs
 send_progress = {}
@@ -292,7 +322,7 @@ def get_quotas():
 
 @app.route("/api/worker/status", methods=["GET"])
 def get_worker_status():
-    status_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "worker_status.json")
+    status_path = os.path.join(DATA_DIR, "worker_status.json")
     if not os.path.exists(status_path):
         return jsonify({"running": False, "last_action": "Worker has never started."})
     try:
@@ -1476,6 +1506,37 @@ def campaign_bounces(campaign_id):
     columns = [d[0] for d in cursor.description]
     conn.close()
     return jsonify([dict(zip(columns, row)) for row in rows])
+
+
+# ─── Frontend SPA Static Serving ─────────────────────────────────────────────
+
+FRONTEND_DIST = os.environ.get(
+    "FRONTEND_DIST",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
+)
+
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def serve_frontend(path):
+    # Pass through unknown /api/ calls as 404 JSON
+    if path.startswith("api/"):
+        return jsonify({"error": "Endpoint not found"}), 404
+
+    # Check for direct static file match in frontend/dist
+    full_path = os.path.join(FRONTEND_DIST, path)
+    if path and os.path.exists(full_path) and os.path.isfile(full_path):
+        return send_from_directory(FRONTEND_DIST, path)
+
+    # React SPA fallback: return index.html for client-side routing
+    index_path = os.path.join(FRONTEND_DIST, "index.html")
+    if os.path.exists(index_path):
+        return send_from_directory(FRONTEND_DIST, "index.html")
+
+    return jsonify({
+        "status": "online",
+        "service": "outreach-tool",
+        "message": f"API is running. (Frontend dist not found at {FRONTEND_DIST})"
+    }), 200
 
 
 # ─── App Startup ──────────────────────────────────────────────────────────────
